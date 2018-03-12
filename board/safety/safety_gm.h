@@ -8,6 +8,11 @@
 //      brake rising edge
 //      brake > 0mph
 
+#ifdef DEBUG
+int puts(const char *a);
+void puth(unsigned int i);
+#endif
+
 // gm_: poor man's namespacing
 int gm_brake_prev = 0;
 int gm_gas_prev = 0;
@@ -38,8 +43,11 @@ static void gm_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
   // check if stock ASCM ECU is still online
   int bus_number = (to_push->RDTR >> 4) & 0xFF;
   if (bus_number == 0 && addr == 715) {
-    gm_ascm_detected = 1;
-    controls_allowed = 0;
+//    gm_ascm_detected = 1;
+//    controls_allowed = 0;
+#ifdef DEBUG
+    puts("ASCM ECU still online, controls_allowed=0\n");
+#endif
   }
 
   // ACC steering wheel buttons
@@ -48,8 +56,14 @@ static void gm_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
     // res/set - enable, cancel button - disable
     if (buttons == 2 || buttons == 3) {
       controls_allowed = 1;
+#ifdef DEBUG
+      puts("buttons=2 or 3, controls_allowed=1\n");
+#endif
     } else if (buttons == 6) {
       controls_allowed = 0;
+#ifdef DEBUG
+      puts("buttons=6, controls_allowed=0\n");
+#endif
     }
   }
 
@@ -64,6 +78,9 @@ static void gm_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
     }
     if (brake && (!gm_brake_prev || gm_speed)) {
        controls_allowed = 0;
+#ifdef DEBUG
+       puts("brake newly applied or brake applied and speed no longer 0, controls_allowed=0 \n");
+#endif
     }
     gm_brake_prev = brake;
   }
@@ -73,6 +90,9 @@ static void gm_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
     int gas = to_push->RDHR & 0xFF0000;
     if (gas && !gm_gas_prev) {
       controls_allowed = 0;
+#ifdef DEBUG
+      puts("gas newly applied, controls_allowed=0\n");
+#endif
     }
     gm_gas_prev = gas;
   }
@@ -82,6 +102,9 @@ static void gm_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
     int regen = to_push->RDLR & 0x20;
     if (regen) {
       controls_allowed = 0;
+#ifdef DEBUG
+      puts("regen paddle applied, controls_allowed=0\n");
+#endif
     }
   }
 }
@@ -96,6 +119,9 @@ static int gm_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
 
   // There can be only one! (ASCM)
   if (gm_ascm_detected) {
+#ifdef DEBUG
+    puts("gm_ascm_detected, exiting gm_tx_hook\n");
+#endif
     return 0;
   }
 
@@ -119,8 +145,14 @@ static int gm_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
     int brake = ((rdlr & 0xF) << 8) + ((rdlr & 0xFF00) >> 8);
     brake = (0x1000 - brake) & 0xFFF;
     if (current_controls_allowed) {
+#ifdef DEBUG
+      puts("brake safety check, exiting\n");
+#endif
       if (brake > 255) return 0;
     } else {
+#ifdef DEBUG
+      puts("brake safety check, exiting\n");
+#endif
       if (brake != 0) return 0;
     }
   }
@@ -133,17 +165,31 @@ static int gm_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
     if (current_controls_allowed) {
       // Signed arithmetic
       if (steer & 0x400) {
+#ifdef DEBUG
+        puts("steering safety check, exiting\n");
+#endif
         if (steer < (0x800 - max_steer)) return 0;
       } else {
+#ifdef DEBUG
+        puts("steering safety check, exiting\n");
+#endif
         if (steer > max_steer) return 0;
       }
     } else {
+#ifdef DEBUG
+      puts("steering safety check, exiting\n");
+#endif
       if (steer != 0) return 0;
     }
   }
 
   // PARK ASSIST STEER: unlimited torque, no thanks
-  if (addr == 823) return 0;
+  if (addr == 823){
+#ifdef DEBUG
+     puts("park assist, exiting\n");
+#endif
+     return 0;
+  }
 
   // GAS/REGEN: safety check
   if (addr == 715) {
@@ -151,11 +197,21 @@ static int gm_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
     int gas_regen = ((rdlr & 0x7F0000) >> 11) + ((rdlr & 0xF8000000) >> 27);
     int apply = rdlr & 1;
     if (current_controls_allowed) {
-      if (gas_regen > 3072) return 0;
+      if (gas_regen > 3072) {
+#ifdef DEBUG
+        puts("regen safety check, exiting\n");
+#endif
+        return 0;
+      }
     } else {
       // Disabled message is !engaed with gas
       // value that corresponds to max regen.
-      if (apply || gas_regen != 1404) return 0;
+      if (apply || gas_regen != 1404) {
+#ifdef DEBUG
+         puts("regen safety check, exiting\n");
+#endif
+         return 0;
+      }
     }
   }
 

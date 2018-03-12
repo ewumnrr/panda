@@ -53,7 +53,11 @@ int can_push(can_ring *q, CAN_FIFOMailBox_TypeDef *elem) {
     ret = 1;
   }
   exit_critical_section();
-  if (ret == 0) puts("can_push failed!\n");
+  if (ret == 0) {
+#ifdef DEBUG
+    puts("can_push failed! Buffer is full\n");
+#endif
+  }
   return ret;
 }
 
@@ -120,18 +124,37 @@ void process_can(uint8_t can_number);
 void can_init(uint8_t can_number) {
   if (can_number == 0xff) return;
 
+#ifdef DEBUG
+  puts("can_init can_number "); puth(can_number); puts("\n");
+  puts("can_init can_loopback "); puth(can_loopback); puts("\n");
+  puts("can_init can_silent "); puth(can_silent); puts("\n");
+#endif
+
   CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
   set_can_enable(CAN, 1);
 
+  // The software initialization can be done while the hardware
+  // is in Initialization mode. To enter this mode the software
+  // sets the INRQ bit in the CAN_MCR register and waits until
+  // the hardware has confirmed the request by setting the
+  // INAK bit in the CAN_MSR register.
+
+  // TTCM = Time Triggered Communication Mode
+  //        (Time stamp receive and sent messages)
   CAN->MCR = CAN_MCR_TTCM | CAN_MCR_INRQ;
   while((CAN->MSR & CAN_MSR_INAK) != CAN_MSR_INAK);
 
+  // BTR = Bit Timig Register
+  // look at the bits at the right time
   // set time quanta from defines
   CAN->BTR = (CAN_BTR_TS1_0 * (CAN_SEQ1-1)) |
              (CAN_BTR_TS2_0 * (CAN_SEQ2-1)) |
              (can_speed_to_prescaler(can_speed[BUS_NUM_FROM_CAN_NUM(can_number)]) - 1);
 
   // silent loopback mode for debugging
+  // SIL = silent mode (no transmit)
+  // LBK = loopback (no external receive, just receiving own sent messages)
+  // SIL + LBK = (internal loopback, nothing is sent or received to/from outside)
   if (can_loopback) {
     CAN->BTR |= CAN_BTR_SILM | CAN_BTR_LBKM;
   }
@@ -141,6 +164,8 @@ void can_init(uint8_t can_number) {
   }
 
   // reset
+  // leave init mode by clearing INRQ
+  // leave time stamps on
   CAN->MCR = CAN_MCR_TTCM | CAN_MCR_ABOM;
 
   #define CAN_TIMEOUT 1000000
@@ -148,31 +173,39 @@ void can_init(uint8_t can_number) {
   while((CAN->MSR & CAN_MSR_INAK) == CAN_MSR_INAK && tmp < CAN_TIMEOUT) tmp++;
 
   if (tmp == CAN_TIMEOUT) {
+#ifdef DEBUG
     puts("CAN init FAILED!!!!!\n");
     puth(can_number); puts(" ");
     puth(BUS_NUM_FROM_CAN_NUM(can_number)); puts("\n");
+#endif
   }
 
-  // accept all filter
+  // filter for not having to receive all
+  // messages
+  // set FINIT bit so the filter can be
+  // modified / set up
   CAN->FMR |= CAN_FMR_FINIT;
 
-  // no mask
+  // no mask, all messages received
   CAN->sFilterRegister[0].FR1 = 0;
   CAN->sFilterRegister[0].FR2 = 0;
   CAN->sFilterRegister[14].FR1 = 0;
   CAN->sFilterRegister[14].FR2 = 0;
   CAN->FA1R |= 1 | (1 << 14);
 
+  // done programming the filters, commit change
   CAN->FMR &= ~(CAN_FMR_FINIT);
 
   // enable certain CAN interrupts
+  // Transmit mailbox empty interrupt enable (RQCPx bit is set)
+  // FIFO message pending interrupt enable (FMP[1:0] bits are not 0) 
   CAN->IER = CAN_IER_TMEIE | CAN_IER_FMPIE0;
 
   switch (can_number) {
     case 0:
-      NVIC_EnableIRQ(CAN1_TX_IRQn);
-      NVIC_EnableIRQ(CAN1_RX0_IRQn);
-      NVIC_EnableIRQ(CAN1_SCE_IRQn);
+      NVIC_EnableIRQ(CAN1_TX_IRQn);  // Send Interrupt
+      NVIC_EnableIRQ(CAN1_RX0_IRQn); // Receive Interrupt
+      NVIC_EnableIRQ(CAN1_SCE_IRQn); // Status Change Error Interrupt
       break;
     case 1:
       NVIC_EnableIRQ(CAN2_TX_IRQn);
@@ -204,7 +237,9 @@ void can_set_gmlan(int bus) {
     // GMLAN OFF
     switch (can_num_lookup[3]) {
       case 1:
+#ifdef DEBUG
         puts("disable GMLAN on CAN2\n");
+#endif
         set_can_mode(1, 0);
         bus_lookup[1] = 1;
         can_num_lookup[1] = 1;
@@ -212,7 +247,9 @@ void can_set_gmlan(int bus) {
         can_init(1);
         break;
       case 2:
+#ifdef DEBUG
         puts("disable GMLAN on CAN3\n");
+#endif
         set_can_mode(2, 0);
         bus_lookup[2] = 2;
         can_num_lookup[2] = 2;
@@ -223,7 +260,9 @@ void can_set_gmlan(int bus) {
   }
 
   if (bus == 1) {
+#ifdef DEBUG
     puts("GMLAN on CAN2\n");
+#endif
     // GMLAN on CAN2
     set_can_mode(1, 1);
     bus_lookup[1] = 3;
@@ -231,7 +270,9 @@ void can_set_gmlan(int bus) {
     can_num_lookup[3] = 1;
     can_init(1);
   } else if (bus == 2 && revision == PANDA_REV_C) {
+#ifdef DEBUG
     puts("GMLAN on CAN3\n");
+#endif
     // GMLAN on CAN3
     set_can_mode(2, 1);
     bus_lookup[2] = 3;
@@ -272,59 +313,141 @@ void can_sce(CAN_TypeDef *CAN) {
 // ***************************** CAN *****************************
 
 void process_can(uint8_t can_number) {
+  static int did_send_once=0;
+  int did_send=0;
+
   if (can_number == 0xff) return;
+
+  // note: this driver is only using transmit mailbox 0, so all bits hard coded for mailbox 0 (xxx0)
 
   enter_critical_section();
 
   CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
   uint8_t bus_number = BUS_NUM_FROM_CAN_NUM(can_number);
   #ifdef DEBUG
-    puts("process CAN TX\n");
+    puts("Tx "); puth(can_number); puts("\n");
   #endif
 
-  // check for empty mailbox
-  CAN_FIFOMailBox_TypeDef to_send;
-  if ((CAN->TSR & CAN_TSR_TME0) == CAN_TSR_TME0) {
-    // add successfully transmitted message to my fifo
-    if ((CAN->TSR & CAN_TSR_RQCP0) == CAN_TSR_RQCP0) {
-      can_txd_cnt += 1;
 
-      if ((CAN->TSR & CAN_TSR_TXOK0) == CAN_TSR_TXOK0) {
-        CAN_FIFOMailBox_TypeDef to_push;
-        to_push.RIR = CAN->sTxMailBox[0].TIR;
-        to_push.RDTR = (CAN->sTxMailBox[0].TDTR & 0xFFFF000F) | ((CAN_BUS_RET_FLAG | bus_number) << 4);
-        to_push.RDLR = CAN->sTxMailBox[0].TDLR;
-        to_push.RDHR = CAN->sTxMailBox[0].TDHR;
-        can_push(&can_rx_q, &to_push);
-      }
+  // Note: FIFO = HW receive buffer, MailBox = HW send buffer
 
-      if ((CAN->TSR & CAN_TSR_TERR0) == CAN_TSR_TERR0) {
-        #ifdef DEBUG
-          puts("CAN TX ERROR!\n");
-        #endif
-      }
+//  puts("MCR:");
+//  puth(CAN->MCR);
+//  puts(" MSR:");
+//  puth(CAN->MSR);
+//  puts(" TSR:");
+//  puth(CAN->TSR);
+//  puts(" RF0R:");
+//  puth(CAN->RF0R);
+//  puts(" RF1R:");
+//  puth(CAN->RF1R);
+#ifdef DEBUG
+  puts("ESR:");
+  puth(CAN->ESR);
+  puts("\n");
+#endif
 
-      if ((CAN->TSR & CAN_TSR_ALST0) == CAN_TSR_ALST0) {
-        #ifdef DEBUG
-          puts("CAN TX ARBITRATION LOST!\n");
-        #endif
-      }
+  // check for bus has gone into passive mode:
+  if ((CAN->ESR & CAN_ESR_EPVF) == CAN_ESR_EPVF) {
+#ifdef DEBUG
+    puts("Bus is passive!!!\n");
+#endif
+  }
 
-      // clear interrupt
-      // careful, this can also be cleared by requesting a transmission
-      CAN->TSR |= CAN_TSR_RQCP0;
+  if (did_send_once) {
+    // error bits get set even if transaction didn't complete
+    if ((CAN->TSR & CAN_TSR_TERR0) == CAN_TSR_TERR0) {
+      #ifdef DEBUG
+        puts("CAN TX ERROR!\n");
+      #endif
     }
 
+    if ((CAN->TSR & CAN_TSR_ALST0) == CAN_TSR_ALST0) {
+      #ifdef DEBUG
+        puts("CAN TX ARBITRATION LOST!\n");
+      #endif
+    }
+
+    if ((CAN->TSR & CAN_TSR_RQCP0) == CAN_TSR_RQCP0) {
+    // check for errors if completion flag is set
+//        puts("previous transmit ended\n");
+      if ((CAN->TSR & CAN_TSR_TXOK0) == CAN_TSR_TXOK0) {
+#ifdef DEBUG
+        puts("prev Tx OK\n");
+#endif
+        can_txd_cnt += 1;
+
+#if 0
+        puts("making a copy if what was sent into can_rx_q queue\n");
+        CAN_FIFOMailBox_TypeDef to_push;
+
+        // RIR  CAN receive FIFO mailbox identifier register */
+        // TIR  CAN TX mailbox identifier register */
+        to_push.RIR = CAN->sTxMailBox[0].TIR;
+
+
+        // RDTR CAN receive FIFO mailbox data length control and time stamp register */
+        // TDTR CAN mailbox data length control and time stamp register */
+        to_push.RDTR = (CAN->sTxMailBox[0].TDTR & 0xFFFF000F) | ((CAN_BUS_RET_FLAG | bus_number) << 4);
+
+        // RDLR CAN receive FIFO mailbox data low register */
+        // TDLR CAN mailbox data low register */
+        to_push.RDLR = CAN->sTxMailBox[0].TDLR;
+
+        // RDHR CAN receive FIFO mailbox data high register */
+        // TDHR CAN mailbox data high register */
+        to_push.RDHR = CAN->sTxMailBox[0].TDHR;
+        can_push(&can_rx_q, &to_push);
+#endif
+      } else { // last transmit was flagged not OK
+#ifdef DEBUG
+          puts("prev Tx NOT OK!!\n");
+#endif
+      }
+    }  else { // transaction did not complete
+#ifdef DEBUG
+        puts("prev Tx pending\n");
+#endif
+    }
+  } // did send once
+
+  // check for empty send mailbox means transaction has completed one way or the other
+  if ((CAN->TSR & CAN_TSR_TME0) == CAN_TSR_TME0) {
+#ifdef DEBUG
+    puts("good, mbox empty\n");
+#endif
+
+    // check if we have a message to send
+    CAN_FIFOMailBox_TypeDef to_send;
     if (can_pop(can_queues[bus_number], &to_send)) {
+#ifdef DEBUG
+      puts("sending message\n");
+#endif
       can_tx_cnt += 1;
-      // only send if we have received a packet
       CAN->sTxMailBox[0].TDLR = to_send.RDLR;
       CAN->sTxMailBox[0].TDHR = to_send.RDHR;
       CAN->sTxMailBox[0].TDTR = to_send.RDTR;
-      CAN->sTxMailBox[0].TIR = to_send.RIR;
+      CAN->sTxMailBox[0].TIR = to_send.RIR;        // this will have the send request bit set (TXRQ)
+      did_send_once=1;
+      did_send=1;
+    } else {
+#ifdef DEBUG
+      puts("Nothing to send\n");
+#endif
     }
+  } else {
+#ifdef DEBUG
+    puts("transmit mbox in use\n");
+#endif
   }
-
+  if (!did_send){
+      // clear interrupt
+      // RQCP is set by hardware when the last request (transmit or abort) has been performed.
+      // Cleared by software writing a “1” or by hardware on transmission request (TXRQ2 set in CAN_TMID2R register).
+      // Clearing this bit clears all the status bits (TXOK, ALST and TERR)
+      // we did not send but need to clear status change interrupt
+      CAN->TSR |= CAN_TSR_RQCP0;
+  }
   exit_critical_section();
 }
 
@@ -333,6 +456,9 @@ void process_can(uint8_t can_number) {
 void can_rx(uint8_t can_number) {
   CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
   uint8_t bus_number = BUS_NUM_FROM_CAN_NUM(can_number);
+#ifdef DEBUG
+  puts("Rx "); puth(can_number); puts("\n");
+#endif
   while (CAN->RF0R & CAN_RF0R_FMP0) {
     can_rx_cnt += 1;
 
@@ -389,6 +515,11 @@ void can_rx(uint8_t can_number) {
       // 842 = Wheel speed (rear)
       } else if (bus_number == 0 && (addr == 189 || addr == 190 || addr == 241 || addr == 298 || addr == 309 || addr == 320 || addr == 388 || addr == 417 || addr == 481 || addr == 485 || addr == 840 || addr == 842)) {
         dst_can_idx = 1; // Sent to Object CAN (to Voltboard VT)
+#ifdef DEBUG
+        puts("msg ");
+        puth(addr);
+        puts(" -> Voltboard bus 1\n");
+#endif
       }
       if (dst_can_idx != -1) {
         CAN_FIFOMailBox_TypeDef to_send;
@@ -407,9 +538,13 @@ void can_rx(uint8_t can_number) {
     #ifdef PANDA
       set_led(LED_BLUE, 1);
     #endif
-    can_push(&can_rx_q, &to_push);
 
-    // next
+#if 0
+    can_push(&can_rx_q, &to_push);
+#endif
+
+    // release FIFO, so it can be reused for incoming packets
+    // otherwise packets will be dropped
     CAN->RF0R |= CAN_RF0R_RFOM0;
   }
 }
@@ -429,7 +564,19 @@ void CAN3_SCE_IRQHandler() { can_sce(CAN3); }
 #endif
 
 void can_send(CAN_FIFOMailBox_TypeDef *to_push, uint8_t bus_number) {
-  if (safety_tx_hook(to_push)) {
+#ifdef DEBUG
+  puts("can_send "); puth(bus_number); puts("\n");
+#endif
+  if ((bus_number==1)  || safety_tx_hook(to_push)) {
+    if (bus_number==1) {
+#ifdef DEBUG
+      puts("safety: Bus 1\n");
+#endif
+    } else {
+#ifdef DEBUG
+      puts("safety: OK\n");
+#endif
+    }
     if (bus_number < BUS_MAX) {
       // add CAN packet to send queue
       // bus number isn't passed through
@@ -437,6 +584,10 @@ void can_send(CAN_FIFOMailBox_TypeDef *to_push, uint8_t bus_number) {
       can_push(can_queues[bus_number], to_push);
       process_can(CAN_NUM_FROM_BUS_NUM(bus_number));
     }
+  } else {
+#ifdef DEBUG
+    puts("safety:NOT OK\n");
+#endif
   }
 }
 
