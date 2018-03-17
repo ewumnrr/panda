@@ -45,6 +45,9 @@ static void gm_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
   if (bus_number == 0 && addr == 715) {
     gm_ascm_detected = 1;
     controls_allowed = 0;
+#ifdef DEBUG
+    puts("ASCM ECU still online, controls_allowed=0\n");
+#endif
   }
 
   // ACC steering wheel buttons
